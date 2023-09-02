@@ -3,25 +3,33 @@ package main
 // #include <stdlib.h>
 import "C"
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
+	"github.com/Jigsaw-Code/outline-go-tun2socks/outline/shadowsocks"
+	"github.com/Jigsaw-Code/outline-go-tun2socks/outline/tun2socks"
+	"github.com/eycorsican/go-tun2socks/common/log"
 	"teon.com/outline-go-tun2socks-windows/main/commands"
 	"teon.com/outline-go-tun2socks-windows/main/commands/base"
+	utf8 "teon.com/outline-go-tun2socks-windows/main/internal"
 
-	oss "github.com/Jigsaw-Code/outline-go-tun2socks/outline/shadowsocks"
-	"github.com/Jigsaw-Code/outline-go-tun2socks/shadowsocks"
-	"github.com/eycorsican/go-tun2socks/common/log"
-	_ "github.com/eycorsican/go-tun2socks/common/log/simple" // Register a simple logger.
+	_ "github.com/eycorsican/go-tun2socks/common/log/simple"
 	"github.com/eycorsican/go-tun2socks/core"
 	"github.com/eycorsican/go-tun2socks/proxy/dnsfallback"
 	"github.com/eycorsican/go-tun2socks/tun"
 )
+
+// Register a simple logger.
 
 const (
 	mtu        = 1500
@@ -32,16 +40,20 @@ const (
 var jsonArgs JsonParams
 
 type JsonParams struct {
-	TunAddr           string `json:"tunAddr"`
-	TunGw             string `json:"tunGw"`
-	TunMask           string `json:"tunMask"`
-	TunName           string `json:"tunName"`
-	TunDNS            string `json:"tunDNS"`
-	ProxyHost         string `json:"proxyHost"`
-	ProxyPort         int    `json:"proxyPort"`
-	ProxyPassword     string `json:"proxyPassword"`
-	ProxyCipher       string `json:"proxyCipher"`
-	ProxyPrefix       string `json:"proxyPrefix"`
+	TunAddr string `json:"tunAddr"`
+	TunGw   string `json:"tunGw"`
+	TunMask string `json:"tunMask"`
+	TunName string `json:"tunName"`
+	TunDNS  string `json:"tunDNS"`
+
+	ProxyHost     string `json:"proxyHost"`
+	ProxyPort     int    `json:"proxyPort"`
+	ProxyPassword string `json:"proxyPassword"`
+	ProxyCipher   string `json:"proxyCipher"`
+	ProxyPrefix   string `json:"proxyPrefix"`
+
+	ProxyConfig string `json:"proxyConfig"`
+
 	LogLevel          string `json:"logLevel"`
 	CheckConnectivity bool   `json:"checkConnectivity"`
 	DnsFallback       bool   `json:"dnsFallback"`
@@ -49,16 +61,21 @@ type JsonParams struct {
 }
 
 var args struct {
-	tunAddr           *string
-	tunGw             *string
-	tunMask           *string
-	tunName           *string
-	tunDNS            *string
-	proxyHost         *string
-	proxyPort         *int
-	proxyPassword     *string
-	proxyCipher       *string
-	proxyPrefix       *string
+	tunAddr *string
+	tunGw   *string
+	tunMask *string
+	tunName *string
+	tunDNS  *string
+
+	// Deprecated: Use proxyConfig instead.
+	proxyHost     *string
+	proxyPort     *int
+	proxyPassword *string
+	proxyCipher   *string
+	proxyPrefix   *string
+
+	proxyConfig *string
+
 	logLevel          *string
 	checkConnectivity *bool
 	dnsFallback       *bool
@@ -89,63 +106,23 @@ func Start(jsonString *C.char) {
 	args.tunMask = &jsonArgs.TunMask
 	args.tunDNS = &jsonArgs.TunDNS
 	args.tunName = &jsonArgs.TunName
+
 	args.proxyHost = &jsonArgs.ProxyHost
 	args.proxyPort = &jsonArgs.ProxyPort
 	args.proxyPassword = &jsonArgs.ProxyPassword
 	args.proxyCipher = &jsonArgs.ProxyCipher
 	args.proxyPrefix = &jsonArgs.ProxyPrefix
+
+	args.proxyConfig = &jsonArgs.ProxyConfig
+
 	args.logLevel = &jsonArgs.LogLevel
 	args.dnsFallback = &jsonArgs.DnsFallback
 	args.checkConnectivity = &jsonArgs.CheckConnectivity
 	args.version = &jsonArgs.Version
-	/*
-		if *args.version {
-			fmt.Println(version)
-			os.Exit(0)
-		}
-	*/
+
 	setLogLevel(*args.logLevel)
 
-	// Validate proxy flags
-	if *args.proxyHost == "" {
-		log.Errorf("Must provide a Shadowsocks proxy host name or IP address")
-		return
-		//os.Exit(oss.IllegalConfiguration)
-	} else if *args.proxyPort <= 0 || *args.proxyPort > 65535 {
-		log.Errorf("Must provide a valid Shadowsocks proxy port [1:65535]")
-		return
-		//os.Exit(oss.IllegalConfiguration)
-	} else if *args.proxyPassword == "" {
-		log.Errorf("Must provide a Shadowsocks proxy password")
-		return
-		//os.Exit(oss.IllegalConfiguration)
-	} else if *args.proxyCipher == "" {
-		log.Errorf("Must provide a Shadowsocks proxy encryption cipher")
-		return
-		//os.Exit(oss.IllegalConfiguration)
-	}
-
-	config := oss.Config{
-		Host:       *args.proxyHost,
-		Port:       *args.proxyPort,
-		Password:   *args.proxyPassword,
-		CipherName: *args.proxyCipher,
-	}
-
-	// The prefix is an 8-bit-clean byte sequence, stored in the codepoint
-	// values of a unicode string, which arrives here encoded in UTF-8.
-	prefixRunes := []rune(*args.proxyPrefix)
-	config.Prefix = make([]byte, len(prefixRunes))
-	for i, r := range prefixRunes {
-		if (r & 0xFF) != r {
-			log.Errorf("Character out of range: %r", r)
-			return
-			//os.Exit(oss.IllegalConfiguration)
-		}
-		config.Prefix[i] = byte(r)
-	}
-
-	client, err := oss.NewClient(&config)
+	client, err := newShadowsocksClientFromArgs()
 	if err != nil {
 		log.Errorf("Failed to construct Shadowsocks client: %v", err)
 		return
@@ -153,7 +130,7 @@ func Start(jsonString *C.char) {
 	}
 
 	if *args.checkConnectivity {
-		connErrCode, err := oss.CheckConnectivity(client)
+		connErrCode, err := shadowsocks.CheckConnectivity(client)
 		log.Debugf("Connectivity checks error code: %v", connErrCode)
 		if err != nil {
 			log.Errorf("Failed to perform connectivity checks: %v", err)
@@ -170,17 +147,18 @@ func Start(jsonString *C.char) {
 		return
 		//os.Exit(oss.SystemMisconfigured)
 	}
+
 	// Output packets to TUN device
 	core.RegisterOutputFn(tunDevice.Write)
 
 	// Register TCP and UDP connection handlers
-	core.RegisterTCPConnHandler(shadowsocks.NewTCPHandler(client))
+	core.RegisterTCPConnHandler(tun2socks.NewTCPHandler(client))
 	if *args.dnsFallback {
 		// UDP connectivity not supported, fall back to DNS over TCP.
 		log.Debugf("Registering DNS fallback UDP handler")
 		core.RegisterUDPConnHandler(dnsfallback.NewUDPHandler())
 	} else {
-		core.RegisterUDPConnHandler(shadowsocks.NewUDPHandler(client, udpTimeout))
+		core.RegisterUDPConnHandler(tun2socks.NewUDPHandler(client, udpTimeout))
 	}
 
 	// Configure LWIP stack to receive input data from the TUN device
@@ -217,4 +195,82 @@ func setLogLevel(level string) {
 	default:
 		log.SetLevel(log.INFO)
 	}
+}
+
+// newShadowsocksClientFromArgs creates a new shadowsocks.Client instance
+// from the global CLI argument object args.
+func newShadowsocksClientFromArgs() (*shadowsocks.Client, error) {
+	if jsonConfig := *args.proxyConfig; len(jsonConfig) > 0 {
+		return shadowsocks.NewClientFromJSON(jsonConfig)
+	} else {
+		// legacy raw flags
+		config := shadowsocks.Config{
+			Host:       *args.proxyHost,
+			Port:       *args.proxyPort,
+			CipherName: *args.proxyCipher,
+			Password:   *args.proxyPassword,
+		}
+		if prefixStr := *args.proxyPrefix; len(prefixStr) > 0 {
+			if p, err := utf8.DecodeUTF8CodepointsToRawBytes(prefixStr); err != nil {
+				return nil, fmt.Errorf("Failed to parse prefix string: %w", err)
+			} else {
+				config.Prefix = p
+			}
+		}
+		return shadowsocks.NewClient(&config)
+	}
+}
+
+type AccessKeyParseResult struct {
+	Host     string `json:"host"`
+	Port     string `json:"port"`
+	Cipher   string `json:"cipher"`
+	Password string `json:"passowrd"`
+}
+
+//export ParseAccessKey
+func ParseAccessKey(accessKey *C.char) *C.char {
+	input := C.GoString(accessKey)
+	accessKeyURL, err := url.Parse(input)
+	if err != nil {
+		fmt.Println("failed to parse access key: %w", err)
+		return C.CString(fmt.Sprintf("Error: %v", err))
+	}
+	var portString string
+	var host string
+	// Host is a <host>:<port> string
+	host, portString, err = net.SplitHostPort(accessKeyURL.Host)
+	if err != nil {
+		fmt.Println("failed to parse endpoint address: %w", err)
+		return C.CString(fmt.Sprintf("Error: %v", err))
+	}
+	cipherInfoBytes, err := base64.URLEncoding.WithPadding(base64.NoPadding).DecodeString(accessKeyURL.User.String())
+	if err != nil {
+		fmt.Println("failed to decode cipher info [%w]: %w", accessKeyURL.User.String(), err)
+		return C.CString(fmt.Sprintf("Error: %v", err))
+	}
+	cipherName, secret, found := strings.Cut(string(cipherInfoBytes), ":")
+	if !found {
+		return C.CString("invalid cipher info: no ':' separator")
+	}
+
+	accessKeyParseResult := AccessKeyParseResult{
+		Host:     host,
+		Port:     portString,
+		Cipher:   cipherName,
+		Password: secret,
+	}
+
+	// 序列化成JSON
+	jsonData, err := json.Marshal(accessKeyParseResult)
+	if err != nil {
+		return C.CString(fmt.Sprintf("Error: %v", err))
+	}
+	return C.CString(string(jsonData))
+}
+
+// FreeString
+func FreeCString(s *C.char) {
+	pointer := unsafe.Pointer(s)
+	C.free(pointer)
 }
