@@ -3,21 +3,31 @@ package main
 // #include <stdlib.h>
 import "C"
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	syslog "log"
 	"net"
 	"net/url"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/Jigsaw-Code/outline-go-tun2socks/outline/shadowsocks"
 	"github.com/Jigsaw-Code/outline-go-tun2socks/outline/tun2socks"
+	"github.com/Jigsaw-Code/outline-sdk/network"
+	"github.com/Jigsaw-Code/outline-sdk/network/lwip2transport"
+	"github.com/Jigsaw-Code/outline-sdk/transport"
+	ss "github.com/Jigsaw-Code/outline-sdk/transport/shadowsocks"
+	"github.com/TeonAllenHu/go-socks5"
+	"github.com/TeonAllenHu/go-socks5/statute"
 	"github.com/eycorsican/go-tun2socks/common/log"
 	"teon.com/outline-go-tun2socks-windows/main/commands"
 	"teon.com/outline-go-tun2socks-windows/main/commands/base"
@@ -28,6 +38,8 @@ import (
 	"github.com/eycorsican/go-tun2socks/proxy/dnsfallback"
 	"github.com/eycorsican/go-tun2socks/tun"
 )
+
+var ipDevice network.IPDevice
 
 // Register a simple logger.
 
@@ -83,9 +95,15 @@ var args struct {
 }
 
 func main() {
+	startTest(60315, "159.203.107.7", "chacha20-ietf-poly1305", "r6WCeI6GwYrEQDAq7aEvxQ", "TEST001")
 	base.BaseCommand.Long = "A unified platform for anti-censorship."
 	base.RegisterCommand(commands.CmdInfo)
 	base.Execute()
+
+	osSignals := make(chan os.Signal, 1)
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	sig := <-osSignals
+	log.Debugf("Received signal: %v", sig)
 }
 
 //export Start
@@ -175,7 +193,7 @@ func Start(jsonString *C.char) {
 	log.Infof("tun2socks running...")
 
 	osSignals := make(chan os.Signal, 1)
-	signal.Notify(osSignals, os.Interrupt, os.Kill, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	sig := <-osSignals
 	log.Debugf("Received signal: %v", sig)
 }
@@ -212,7 +230,7 @@ func newShadowsocksClientFromArgs() (*shadowsocks.Client, error) {
 		}
 		if prefixStr := *args.proxyPrefix; len(prefixStr) > 0 {
 			if p, err := utf8.DecodeUTF8CodepointsToRawBytes(prefixStr); err != nil {
-				return nil, fmt.Errorf("Failed to parse prefix string: %w", err)
+				return nil, fmt.Errorf("failed to parse prefix string: %w", err)
 			} else {
 				config.Prefix = p
 			}
@@ -269,8 +287,314 @@ func ParseAccessKey(accessKey *C.char) *C.char {
 	return C.CString(string(jsonData))
 }
 
-// FreeString
+//export FreeCString
 func FreeCString(s *C.char) {
 	pointer := unsafe.Pointer(s)
 	C.free(pointer)
+}
+
+func parseStringPrefix(utf8Str string) ([]byte, error) {
+	runes := []rune(utf8Str)
+	rawBytes := make([]byte, len(runes))
+	for i, r := range runes {
+		if (r & 0xFF) != r {
+			return nil, fmt.Errorf("character out of range: %d", r)
+		}
+		rawBytes[i] = byte(r)
+	}
+	return rawBytes, nil
+}
+
+//export StartWithoutTAP
+func StartWithoutTAP(port int, addrP, cipherP, secretP, prefixP *C.char) *C.char {
+	if ipDevice != nil {
+		return nil
+	}
+
+	cipher := C.GoString(cipherP)
+	secret := C.GoString(secretP)
+
+	cryptoKey, err := ss.NewEncryptionKey(cipher, secret)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+
+	addr := C.GoString(addrP)
+	var dialer net.Dialer = net.Dialer{}
+
+	streamDialer, err := ss.NewStreamDialer(&transport.TCPEndpoint{Dialer: dialer, Address: addr}, cryptoKey)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+
+	prefix := C.GoString(prefixP)
+	// More about prefix: https://www.reddit.com/r/outlinevpn/wiki/index/prefixing/
+	if len(prefix) > 0 {
+		prefix, err := parseStringPrefix(prefix)
+		if err != nil {
+			return C.CString(err.Error())
+		}
+		streamDialer.SaltGenerator = ss.NewPrefixSaltGenerator(prefix)
+	}
+	packetListener, err := ss.NewPacketListener(transport.UDPEndpoint{Dialer: dialer, Address: addr}, cryptoKey)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+	// TODO Support dnstruncate packet proxy in case the server doesn't support UDP,
+	// server connectivity can be tested by `TestConnectivity`.
+	packetProxy, err := network.NewPacketProxyFromPacketListener(packetListener)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+	ipDevice, err = lwip2transport.ConfigureDevice(streamDialer, packetProxy)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+	// Create a SOCKS5 server
+	server := socks5.NewServer(
+		socks5.WithLogger(socks5.NewLogger(syslog.New(os.Stdout, "socks5: ", syslog.LstdFlags))),
+		socks5.WithConnectHandle(handleConnect),
+		socks5.WithAssociateHandle(handleAssociate),
+	)
+
+	// Create SOCKS5 proxy on localhost port
+	go func() {
+		socks5Addr := fmt.Sprintf("127.0.0.1:%d", port)
+		if err := server.ListenAndServe("tcp", socks5Addr); err != nil {
+			panic(err)
+		}
+	}()
+	return nil
+}
+
+func startTest(port int, addr, cipher, secret, prefix string) *C.char {
+	if ipDevice != nil {
+		return nil
+	}
+
+	//cipher := C.GoString(cipherP)
+	//secret := C.GoString(secretP)
+
+	cryptoKey, err := ss.NewEncryptionKey(cipher, secret)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+
+	//addr := C.GoString(addrP)
+	var dialer net.Dialer = net.Dialer{}
+
+	streamDialer, err := ss.NewStreamDialer(&transport.TCPEndpoint{Dialer: dialer, Address: addr}, cryptoKey)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+
+	//prefix := C.GoString(prefixP)
+	// More about prefix: https://www.reddit.com/r/outlinevpn/wiki/index/prefixing/
+	if len(prefix) > 0 {
+		prefix, err := parseStringPrefix(prefix)
+		if err != nil {
+			return C.CString(err.Error())
+		}
+		streamDialer.SaltGenerator = ss.NewPrefixSaltGenerator(prefix)
+	}
+	packetListener, err := ss.NewPacketListener(transport.UDPEndpoint{Dialer: dialer, Address: addr}, cryptoKey)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+	// TODO Support dnstruncate packet proxy in case the server doesn't support UDP,
+	// server connectivity can be tested by `TestConnectivity`.
+	packetProxy, err := network.NewPacketProxyFromPacketListener(packetListener)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+	ipDevice, err = lwip2transport.ConfigureDevice(streamDialer, packetProxy)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+	// Create a SOCKS5 server
+	server := socks5.NewServer(
+		socks5.WithLogger(socks5.NewLogger(syslog.New(os.Stdout, "socks5: ", syslog.LstdFlags))),
+		socks5.WithConnectHandle(handleConnect),
+		socks5.WithAssociateHandle(handleAssociate),
+	)
+
+	// Create SOCKS5 proxy on localhost port
+	go func() {
+		socks5Addr := fmt.Sprintf("127.0.0.1:%d", port)
+		if err := server.ListenAndServe("tcp", socks5Addr); err != nil {
+			panic(err)
+		}
+	}()
+	return nil
+}
+
+// handleConnect is used to handle a connect command
+func handleConnect(ctx context.Context, sf *socks5.Server, writer io.Writer, request *socks5.Request) error {
+
+	// Send success
+	/*
+		if err := socks5.SendReply(writer, statute.RepSuccess, request.LocalAddr); err != nil {
+			return fmt.Errorf("failed to send reply, %v", err)
+		}*/
+	// Start proxying
+	errCh := make(chan error, 2)
+	sf.GoFunc(func() { errCh <- sf.Proxy(ipDevice, request.Reader) })
+	sf.GoFunc(func() { errCh <- sf.Proxy(writer, ipDevice) })
+	// Wait
+	for i := 0; i < 2; i++ {
+		e := <-errCh
+		if e != nil {
+			// return from this function closes target (and conn).
+			return e
+		}
+	}
+	return nil
+}
+
+func handleAssociate(ctx context.Context, sf *socks5.Server, writer io.Writer, request *socks5.Request) error {
+
+	localAddrUDP, err := net.ResolveUDPAddr("udp", request.RemoteAddr.String())
+	if err != nil {
+		if err := socks5.SendReply(writer, statute.RepServerFailure, nil); err != nil {
+			return fmt.Errorf("failed to send reply, %v", err)
+		}
+		return fmt.Errorf("failed to resolve udp addr, %v", err)
+	}
+	bindLn, err := net.ListenUDP("udp", localAddrUDP)
+	if err != nil {
+		if err := socks5.SendReply(writer, statute.RepServerFailure, nil); err != nil {
+			return fmt.Errorf("failed to send reply, %v", err)
+		}
+		return fmt.Errorf("listen udp failed, %v", err)
+	}
+
+	log.Infof("client addr %v", request.LocalAddr)
+	log.Infof("client want to used addr %v, listen addr: %s", request.DestAddr, bindLn.LocalAddr())
+	// send BND.ADDR and BND.PORT, client used
+	if err = socks5.SendReply(writer, statute.RepSuccess, bindLn.LocalAddr()); err != nil {
+		return fmt.Errorf("failed to send reply, %v", err)
+	}
+
+	log.Infof("started proxy, listen addr: %s", bindLn.LocalAddr())
+	sf.GoFunc(func() {
+		// read from client and write to remote server
+		conns := sync.Map{}
+		bufPool := sf.GetBuffer()
+		defer func() {
+			sf.PutBuffer(bufPool)
+			bindLn.Close()
+			/*
+				conns.Range(func(key, value any) bool {
+					if connTarget, ok := value.(net.Conn); !ok {
+						log.Errorf("conns has illegal item %v:%v", key, value)
+					} else {
+						connTarget.Close()
+					}
+					return true
+				})*/
+		}()
+		for {
+			n, srcAddr, err := bindLn.ReadFromUDP(bufPool[:cap(bufPool)])
+			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+					return
+				}
+				log.Errorf("udp read bind data fail: %s", err)
+				continue
+			}
+			log.Infof("bindLn.ReadFromUDP length: %d", n)
+			pk, err := statute.ParseDatagram(bufPool[:n])
+			if err != nil {
+				log.Errorf("udp parse data fail: %s", err)
+				continue
+			}
+
+			// check src addr whether equal requst.DestAddr
+			/*
+				srcEqual := ((request.DestAddr.IP.IsUnspecified()) || request.DestAddr.IP.Equal(srcAddr.IP)) && (request.DestAddr.Port == 0 || request.DestAddr.Port == srcAddr.Port) //nolint:lll
+				if !srcEqual {
+					continue
+				}*/
+
+			connKey := srcAddr.String() + "--" + pk.DstAddr.String()
+			log.Infof("connKey: %s", connKey)
+			if target, ok := conns.Load(connKey); !ok {
+				// if the 'connection' doesn't exist, create one and store it
+				targetNew := ipDevice
+				conns.Store(connKey, targetNew)
+				// read from remote server and write to original client
+				sf.GoFunc(func() {
+					bufPool := sf.GetBuffer()
+					defer func() {
+						conns.Delete(connKey)
+						sf.PutBuffer(bufPool)
+					}()
+
+					for {
+						buf := bufPool[:cap(bufPool)]
+						n, err := targetNew.Read(buf)
+						if err != nil {
+							if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+								return
+							}
+							log.Errorf("read data from remote failed, %v", err)
+							return
+						}
+						log.Infof("read data from remote, length %v", n)
+						tmpBufPool := sf.GetBuffer()
+						proBuf := tmpBufPool
+						proBuf = append(proBuf, pk.Header()...)
+						proBuf = append(proBuf, buf[:n]...)
+						n1, err := bindLn.WriteTo(proBuf, srcAddr)
+						if err != nil {
+							sf.PutBuffer(tmpBufPool)
+							log.Errorf("write data to client %s failed, %v", srcAddr, err)
+							return
+						}
+						log.Infof("write data to client %s, length %v", srcAddr, n1)
+						sf.PutBuffer(tmpBufPool)
+					}
+				})
+
+				n, err := targetNew.Write(pk.Data)
+				if err != nil {
+					log.Errorf("write data to remote server failed, %v", err)
+					return
+				}
+				log.Infof("write data to client %s, length %v", srcAddr, n)
+			} else {
+				n, err := target.(io.Writer).Write(pk.Data)
+				if err != nil {
+					log.Errorf("write data to remote server failed, %v", err)
+					return
+				}
+				log.Infof("write data to client %s, length %v", srcAddr, n)
+			}
+		}
+	})
+
+	buf := sf.GetBuffer()
+	defer sf.PutBuffer(buf)
+
+	for {
+		_, err := request.Reader.Read(buf[:cap(buf)])
+		// sf.logger.Errorf("read data from client %s, %d bytesm, err is %+v", request.RemoteAddr.String(), num, err)
+		if err != nil {
+			bindLn.Close()
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+//export Stop
+func Stop() *C.char {
+	if ipDevice != nil {
+		err := ipDevice.Close()
+		ipDevice = nil
+		return C.CString(err.Error())
+	}
+	return nil
 }
