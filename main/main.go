@@ -408,15 +408,17 @@ func startTest(port int, addr, cipher, secret, prefix string) *C.char {
 
 	// TODO Support dnstruncate packet proxy in case the server doesn't support UDP,
 	// server connectivity can be tested by `TestConnectivity`.
-	packetProxy, err := network.NewPacketProxyFromPacketListener(packetListener)
-	if err != nil {
-		return C.CString(err.Error())
-	}
+	/*
+		packetProxy, err := network.NewPacketProxyFromPacketListener(packetListener)
+		if err != nil {
+			return C.CString(err.Error())
+		}
 
-	ipDevice, err = lwip2transport.ConfigureDevice(streamDialer, packetProxy)
-	if err != nil {
-		return C.CString(err.Error())
-	}
+		ipDevice, err = lwip2transport.ConfigureDevice(streamDialer, packetProxy)
+		if err != nil {
+			return C.CString(err.Error())
+		}
+	*/
 	// Create a SOCKS5 server
 	server := socks5.NewServer(
 		socks5.WithLogger(socks5.NewLogger(syslog.New(os.Stdout, "socks5: ", syslog.LstdFlags))),
@@ -424,7 +426,7 @@ func startTest(port int, addr, cipher, secret, prefix string) *C.char {
 			return streamDialer.Dial(ctx, addr)
 		}),
 		//socks5.WithConnectHandle(handleConnect),
-		socks5.WithAssociateHandle(handleAssociate2),
+		socks5.WithAssociateHandle(handleAssociate),
 	)
 
 	// Create SOCKS5 proxy on localhost port
@@ -437,262 +439,8 @@ func startTest(port int, addr, cipher, secret, prefix string) *C.char {
 	return nil
 }
 
-// handleConnect is used to handle a connect command
-func handleConnect(ctx context.Context, sf *socks5.Server, writer io.Writer, request *socks5.Request) error {
-	fmt.Println("handling socks5 connect")
-
-	addr := "159.203.107.7:443"
-	cipher := "chacha20-ietf-poly1305"
-	secret := "r6WCeI6GwYrEQDAq7aEvxQ"
-	prefix := "TEST001"
-
-	fmt.Println("creating ss cipher")
-	cryptoKey, err := ss.NewEncryptionKey(cipher, secret)
-	if err != nil {
-		return errors.New("error new ss cipher")
-	}
-
-	var dialer net.Dialer = net.Dialer{}
-
-	fmt.Println("creating ss stream")
-	streamDialer, err := ss.NewStreamDialer(&transport.TCPEndpoint{Dialer: dialer, Address: addr}, cryptoKey)
-	if err != nil {
-		return errors.New("error new ss dialer")
-	}
-
-	fmt.Println("dialing ss stream for target", request.DestAddr.String())
-	stream, err := streamDialer.Dial(ctx, request.DestAddr.String())
-	if err != nil {
-		return errors.New("error new dial ss")
-	}
-
-	fmt.Println("created ss stream")
-
-	// More about prefix: https://www.reddit.com/r/outlinevpn/wiki/index/prefixing/
-	if len(prefix) > 0 {
-		prefix, err := parseStringPrefix(prefix)
-		if err != nil {
-			return errors.New("error parse prefix")
-		}
-		streamDialer.SaltGenerator = ss.NewPrefixSaltGenerator(prefix)
-	}
-
-	// Send success
-
-	fmt.Println("send socks5 success resp")
-	if err := socks5.SendReplyWithAddr(writer, statute.RepSuccess, request.LocalAddr); err != nil {
-		return fmt.Errorf("failed to send reply, %v", err)
-	}
-
-	fmt.Println("start proxying conn")
-	// Start proxying
-	errCh := make(chan error, 2)
-	sf.GoFunc(func() { errCh <- sf.Proxy(stream, request.Reader) })
-	sf.GoFunc(func() { errCh <- sf.Proxy(writer, stream) })
-	// Wait
-	for i := 0; i < 2; i++ {
-		e := <-errCh
-		if e != nil {
-			// return from this function closes target (and conn).
-			return e
-		}
-	}
-	return nil
-}
-
-/*
-// handleConnect is used to handle a connect command
-func handleConnect(ctx context.Context, sf *socks5.Server, writer io.Writer, request *socks5.Request) error {
-
-		// Send success
-
-		if err := socks5.SendReply(writer, statute.RepSuccess, request.LocalAddr); err != nil {
-			return fmt.Errorf("failed to send reply, %v", err)
-		}
-		// Start proxying
-		errCh := make(chan error, 2)
-		sf.GoFunc(func() { errCh <- sf.Proxy(ipDevice, request.Reader) })
-		sf.GoFunc(func() { errCh <- sf.Proxy(writer, ipDevice) })
-		// Wait
-		for i := 0; i < 2; i++ {
-			e := <-errCh
-			if e != nil {
-				// return from this function closes target (and conn).
-				return e
-			}
-		}
-		return nil
-	}
-*/
-/*
-func handleAssociate(ctx context.Context, sf *socks5.Server, writer io.Writer, request *socks5.Request) error {
-
-		addr := "159.203.107.7:443"
-		cipher := "chacha20-ietf-poly1305"
-		secret := "r6WCeI6GwYrEQDAq7aEvxQ"
-
-		fmt.Println("creating ss cipher")
-		cryptoKey, err := ss.NewEncryptionKey(cipher, secret)
-		if err != nil {
-			return errors.New("error new ss cipher")
-		}
-
-		var dialer net.Dialer = net.Dialer{}
-
-		fmt.Println("creating ss stream")
-		packetListener, err := ss.NewPacketListener(&transport.UDPEndpoint{Dialer: dialer, Address: addr}, cryptoKey)
-		if err != nil {
-			return errors.New("error new ss dialer")
-		}
-
-		fmt.Println("dialing ss stream for target", request.DestAddr.String())
-		stream, err := packetListener.di(ctx, request.DestAddr.String())
-		if err != nil {
-			return errors.New("error new dial ss")
-		}
-		fmt.Println("created ss stream")
-
-
-	localAddrUDP, err := net.ResolveUDPAddr("udp", request.RemoteAddr.String())
-	if err != nil {
-		if err := socks5.SendReply(writer, statute.RepServerFailure); err != nil {
-			return fmt.Errorf("failed to send reply, %v", err)
-		}
-		return fmt.Errorf("failed to resolve udp addr, %v", err)
-	}
-	//return errors.New("listen udp failed")
-
-	bindLn, err := net.ListenUDP("udp", localAddrUDP)
-	if err != nil {
-		if err := socks5.SendReply(writer, statute.RepServerFailure); err != nil {
-			return fmt.Errorf("failed to send reply, %v", err)
-		}
-		return fmt.Errorf("listen udp failed, %v", err)
-	}
-
-	log.Infof("client addr %v", request.LocalAddr)
-	log.Infof("client want to used addr %v, listen addr: %s", request.DestAddr, bindLn.LocalAddr())
-	// send BND.ADDR and BND.PORT, client used
-	if err = socks5.SendReplyWithAddr(writer, statute.RepSuccess, bindLn.LocalAddr()); err != nil {
-		return fmt.Errorf("failed to send reply, %v", err)
-	}
-
-	log.Infof("started proxy, listen addr: %s", bindLn.LocalAddr())
-	sf.GoFunc(func() {
-		// read from client and write to remote server
-		conns := sync.Map{}
-		bufPool := sf.GetBuffer()
-		defer func() {
-			sf.PutBuffer(bufPool)
-			bindLn.Close()
-
-				conns.Range(func(key, value any) bool {
-					if connTarget, ok := value.(net.Conn); !ok {
-						log.Errorf("conns has illegal item %v:%v", key, value)
-					} else {
-						connTarget.Close()
-					}
-					return true
-				})
-		}()
-		for {
-			n, srcAddr, err := bindLn.ReadFromUDP(bufPool[:cap(bufPool)])
-			if err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-					return
-				}
-				log.Errorf("udp read bind data fail: %s", err)
-				continue
-			}
-			log.Infof("bindLn.ReadFromUDP length: %d", n)
-			pk, err := statute.ParseDatagram(bufPool[:n])
-			if err != nil {
-				log.Errorf("udp parse data fail: %s", err)
-				continue
-			}
-
-			// check src addr whether equal requst.DestAddr
-
-				srcEqual := ((request.DestAddr.IP.IsUnspecified()) || request.DestAddr.IP.Equal(srcAddr.IP)) && (request.DestAddr.Port == 0 || request.DestAddr.Port == srcAddr.Port) //nolint:lll
-				if !srcEqual {
-					continue
-				}
-
-			connKey := srcAddr.String() + "--" + pk.DstAddr.String()
-			log.Infof("connKey: %s", connKey)
-			if target, ok := conns.Load(connKey); !ok {
-				// if the 'connection' doesn't exist, create one and store it
-				targetNew := ipDevice
-				conns.Store(connKey, targetNew)
-				// read from remote server and write to original client
-				sf.GoFunc(func() {
-					bufPool := sf.GetBuffer()
-					defer func() {
-						conns.Delete(connKey)
-						sf.PutBuffer(bufPool)
-					}()
-
-					for {
-						buf := bufPool[:cap(bufPool)]
-						n, err := targetNew.Read(buf)
-						if err != nil {
-							if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-								return
-							}
-							log.Errorf("read data from remote failed, %v", err)
-							return
-						}
-						log.Infof("read data from remote, length %v", n)
-						tmpBufPool := sf.GetBuffer()
-						proBuf := tmpBufPool
-						proBuf = append(proBuf, pk.Header()...)
-						proBuf = append(proBuf, buf[:n]...)
-						n1, err := bindLn.WriteTo(proBuf, srcAddr)
-						if err != nil {
-							sf.PutBuffer(tmpBufPool)
-							log.Errorf("write data to client %s failed, %v", srcAddr, err)
-							return
-						}
-						log.Infof("write data to client %s, length %v", srcAddr, n1)
-						sf.PutBuffer(tmpBufPool)
-					}
-				})
-
-				n, err := targetNew.Write(pk.Data)
-				if err != nil {
-					log.Errorf("write data to remote server failed, %v", err)
-					return
-				}
-				log.Infof("write data to client %s, length %v", srcAddr, n)
-			} else {
-				n, err := target.(io.Writer).Write(pk.Data)
-				if err != nil {
-					log.Errorf("write data to remote server failed, %v", err)
-					return
-				}
-				log.Infof("write data to client %s, length %v", srcAddr, n)
-			}
-		}
-	})
-
-	buf := sf.GetBuffer()
-	defer sf.PutBuffer(buf)
-
-	for {
-		_, err := request.Reader.Read(buf[:cap(buf)])
-		// sf.logger.Errorf("read data from client %s, %d bytesm, err is %+v", request.RemoteAddr.String(), num, err)
-		if err != nil {
-			bindLn.Close()
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			return err
-		}
-	}
-}
-*/
 // handleAssociate is used to handle a connect command
-func handleAssociate2(ctx context.Context, sf *socks5.Server, writer io.Writer, request *socks5.Request) error {
+func handleAssociate(ctx context.Context, sf *socks5.Server, writer io.Writer, request *socks5.Request) error {
 	// Attempt to connect
 	bindLn, err := net.ListenUDP("udp", nil)
 	if err != nil {
