@@ -10,8 +10,6 @@ require github.com/Jigsaw-Code/outline-sdk v0.0.6
 
 require github.com/TeonAllenHu/go-socks5 v0.0.0
 
-require github.com/things-go/go-socks5 v0.0.4 // indirect
-
 replace github.com/TeonAllenHu/go-socks5 => ../go-socks5
 
 require (
