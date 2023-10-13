@@ -292,7 +292,7 @@ func StartWithSocks5(port int, addrP, cipherP, secretP, prefixP *C.char, logLeve
 	// Create SOCKS5 proxy on localhost port
 	go func() {
 		socks5Addr := fmt.Sprintf("127.0.0.1:%d", port)
-		if err := server.ListenAndServe("tcp", socks5Addr); err != nil {
+		if err := server.ListenTcpAndServe(socks5Addr); err != nil {
 			panic(err)
 		}
 	}()
@@ -441,6 +441,7 @@ func handleAssociate(ctx context.Context, sf *socks5.Server, writer io.Writer, r
 	}
 }
 
+//export IsServerStarted
 func IsServerStarted() bool {
 	return server != nil
 }
@@ -454,6 +455,7 @@ func FreeCString(s *C.char) {
 //export StopWithSocks5
 func StopWithSocks5() {
 	if IsServerStarted() {
+		server.StopListenTcp()
 		server = nil
 	}
 }
